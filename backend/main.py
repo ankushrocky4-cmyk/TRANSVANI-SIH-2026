@@ -72,3 +72,39 @@ def create_reading(reading: TransformerReading):
     connection.close()
 
     return {"message": "Reading stored successfully"}
+
+
+@app.get("/api/readings")
+def get_readings():
+    connection = get_connection()
+
+    rows = connection.execute("""
+        SELECT *
+        FROM readings
+        ORDER BY id DESC
+        """).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/transformers")
+def get_transformers():
+    connection = get_connection()
+
+    rows = connection.execute("""
+        SELECT r.*
+        FROM readings r
+        INNER JOIN (
+            SELECT transformer_id, MAX(id) AS max_id
+            FROM readings
+            GROUP BY transformer_id
+        ) latest
+        ON r.id = latest.max_id
+        ORDER BY score ASC
+        """).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
