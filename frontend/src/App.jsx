@@ -27,22 +27,35 @@ import {
   Line,
   CartesianGrid
 } from "recharts";
-import { mockData } from "./mockData";
+
+// Shown until the first real reading arrives from the ESP32 over
+// Web Serial. No mock/demo data anywhere -- this is just a safe
+// placeholder so the UI doesn't crash on undefined fields before
+// a connection is made.
+const EMPTY_TELEMETRY = {
+  txId: "--",
+  substation: "--",
+  district: "--",
+  healthScore: 0,
+  status: "Awaiting Connection",
+  harmonicDev: 0,
+  vibRMS: 0,
+  temp: 0,
+  humidity: 0,
+  loadCurrent: "--",
+  explanation: "Connect the ESP32 over USB to start receiving live readings.",
+  harmonics: { "50Hz": 0, "100Hz": 0, "200Hz": 0, "300Hz": 0 },
+  baseline: { "50Hz": 0, "100Hz": 0, "200Hz": 0, "300Hz": 0 }
+};
 
 export default function App() {
-  const [telemetry, setTelemetry] = useState(mockData.normal);
-  const [history, setHistory] = useState([
-    { time: "T-4", score: 95 },
-    { time: "T-3", score: 94 },
-    { time: "T-2", score: 92 },
-    { time: "T-1", score: 93 },
-    { time: "Live", score: 92 }
-  ]);
+  const [telemetry, setTelemetry] = useState(EMPTY_TELEMETRY);
+  const [history, setHistory] = useState([]);
   const [connected, setConnected] = useState(false);
   const [activeTab, setActiveTab] = useState("live");
   const serialReaderRef = useRef(null);
 
-  // Web Serial API (Streams live JSON directly from teammate's ESP32)
+  // Web Serial API (Streams live JSON directly from the ESP32)
   const connectSerial = async () => {
     if (!("serial" in navigator)) {
       alert("Please open this app in Google Chrome or Microsoft Edge for Web Serial support.");
@@ -53,6 +66,7 @@ export default function App() {
       const port = await navigator.serial.requestPort();
       await port.open({ baudRate: 115200 });
       setConnected(true);
+      console.log("TRANSVANI: serial port opened, listening for JSON lines...");
 
       const textDecoder = new TextDecoderStream();
       port.readable.pipeTo(textDecoder.writable);
@@ -74,19 +88,31 @@ export default function App() {
               const data = JSON.parse(trimmed);
               setTelemetry((prev) => ({
                 ...prev,
+                txId: data.txId ?? prev.txId,
+                substation: data.substation ?? prev.substation,
+                district: data.district ?? prev.district,
                 healthScore: data.healthScore ?? prev.healthScore,
                 status: data.status ?? prev.status,
                 harmonicDev: data.harmonicDev ?? prev.harmonicDev,
                 vibRMS: data.vibRMS ?? prev.vibRMS,
                 temp: data.temp ?? prev.temp,
                 humidity: data.humidity ?? prev.humidity,
-                harmonics: data.harmonics ?? prev.harmonics
+                loadCurrent: data.loadCurrent ?? prev.loadCurrent,
+                explanation: data.explanation ?? prev.explanation,
+                harmonics: data.harmonics ?? prev.harmonics,
+                baseline: data.baseline ?? prev.baseline
               }));
-              setHistory((prev) => [
-                ...prev.slice(1),
-                { time: new Date().toLocaleTimeString().slice(3, 8), score: data.healthScore }
-              ]);
-            } catch (err) {}
+              setHistory((prev) => {
+                const next = [
+                  ...prev,
+                  { time: new Date().toLocaleTimeString().slice(3, 8), score: data.healthScore }
+                ];
+                const MAX_POINTS = 20;
+                return next.length > MAX_POINTS ? next.slice(next.length - MAX_POINTS) : next;
+              });
+            } catch (err) {
+              console.error("TRANSVANI: failed to parse serial line as JSON:", trimmed, err);
+            }
           }
         }
       }
@@ -175,31 +201,16 @@ export default function App() {
           </div>
         </header>
 
-        {/* Presentation Simulation Toolbar */}
+        {/* Live Connection Status Strip */}
         <div className="bg-slate-900/60 border border-slate-800/80 px-4 py-2.5 rounded-xl flex flex-wrap items-center justify-between text-xs text-slate-400 gap-3">
           <span className="flex items-center gap-1.5 font-medium">
-            <Sliders className="w-4 h-4 text-indigo-400" /> Demo Simulator:
+            <Sliders className="w-4 h-4 text-indigo-400" /> Data Source:
           </span>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setTelemetry(mockData.normal)}
-              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-emerald-400 border border-emerald-500/30 rounded-lg"
-            >
-              1. Normal Condition
-            </button>
-            <button
-              onClick={() => setTelemetry(mockData.monitor)}
-              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-400 border border-amber-500/30 rounded-lg"
-            >
-              2. Temp Spikes (Monitor)
-            </button>
-            <button
-              onClick={() => setTelemetry(mockData.critical)}
-              className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-rose-400 border border-rose-500/30 rounded-lg"
-            >
-              3. Critical Worsening
-            </button>
-          </div>
+          <span className={connected ? "text-emerald-400 font-semibold" : "text-slate-500"}>
+            {connected
+              ? "Live -- streaming JSON from ESP32 over USB Serial"
+              : "Not connected -- click \"Connect ESP32 (USB)\" above to start"}
+          </span>
         </div>
 
         {activeTab === "live" ? (

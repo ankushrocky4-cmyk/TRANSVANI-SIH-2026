@@ -17,6 +17,7 @@
 //   RGB LED  -> status
 //   Buzzer   -> abnormal-event alert
 //   BLE      -> advertises health score + category (no pairing)
+//   Serial   -> JSON status line every loop (for collector.py / dashboard)
 //
 // ESP32
 // ============================================================
@@ -71,19 +72,58 @@ int32_t audioSamples[SAMPLE_COUNT];
 //         TRANSVANI IDENTITY / HEALTH ENGINE PARAMETERS
 // ============================================================
 
-#define TRANSFORMER_ID        1        // change per deployed unit
-#define BASELINE_SAMPLES       20        // loop cycles used to learn the baseline (~40s @ 2s/loop)
-#define HISTORY_LENGTH          5        // rolling window used for persistence/trend checks
+#define TRANSFORMER_ID          1        // change per deployed unit
+#define BASELINE_SAMPLES         20        // loop cycles used to learn the baseline (~40s @ 2s/loop)
+#define HISTORY_LENGTH            5        // rolling window used for persistence/trend checks
+
+// --------------------------------------------------------------
+// Static identity / location metadata -- NOT sensor readings.
+// These are fixed per deployed unit; edit them for your actual
+// site. Defaults below match the frontend's mockData.js exactly
+// so the JSON output is a drop-in match for testing.
+// --------------------------------------------------------------
+#define TRANSFORMER_TX_ID     "TX-RUR-0941"
+#define TRANSFORMER_SUBSTATION "Vellore 110/11kV Sub-02"
+#define TRANSFORMER_DISTRICT   "Vellore"
 
 // Deviation is flagged as "anomalous" once it crosses this percentage.
 #define ANOMALY_DEVIATION_THRESHOLD   25.0
 
-// Category codes broadcast over BLE (kept as a single byte).
+// Category codes broadcast over BLE / used internally (single byte).
 #define CATEGORY_NORMAL          0
 #define CATEGORY_MONITOR         1
 #define CATEGORY_INSPECT_SOON    2
 #define CATEGORY_CRITICAL        3
 #define CATEGORY_BASELINING      4
+
+// ADXL345 full-resolution sensitivity (typical datasheet value, ~3.9 mg/LSB).
+// Used to express vibration as an approximate "g" magnitude for the JSON
+// output. This is the magnitude of the RAW accelerometer vector (so at
+// rest it reads ~1.0g from gravity alone) -- NOT a true time-averaged RMS,
+// since we only take one accelerometer sample per loop. Recalibrate
+// against your actual unit if you need this to be metrologically accurate.
+#define ADXL345_LSB_TO_G       0.0039
+
+// Display-only scaling for harmonic power -> a small human-readable
+// intensity number (NOT a physical unit, NOT dB). Calibrated against
+// real hardware readings (raw Goertzel power observed in the 0.7-7
+// range during initial bench testing -> scale chosen so that range
+// lands around 30-300 on the display, well under the 9999 clamp).
+// Re-tune if your mic/enclosure/gain setup gives very different
+// raw levels -- watch the "MIC | ___ Hz Power" Serial lines and
+// adjust this until scaledHarmonic() output looks sensible.
+#define HARMONIC_DISPLAY_SCALE   40.0
+#define HARMONIC_DISPLAY_MAX     9999
+
+// --------------------------------------------------------------
+// NOTE: There is no current sensor wired in this prototype. The
+// report/BOM treats it as optional hardware (e.g. a non-invasive
+// CT clamp / ACS712) that hasn't been added yet. Until it exists,
+// loadCurrent is honestly reported as "N/A" in the JSON output --
+// set HAS_CURRENT_SENSOR to 1 and implement readLoadCurrentAmps()
+// once the sensor is wired.
+// --------------------------------------------------------------
+#define HAS_CURRENT_SENSOR   0
 
 
 // ============================================================
@@ -543,13 +583,20 @@ float findDominantFrequency() {
 // ============================================================
 //                     MICROPHONE ANALYSIS
 // ============================================================
+//
+// Now also extracts 50 Hz and 300 Hz harmonic power (in addition
+// to the original 100 Hz / 200 Hz) so the JSON output can report
+// a 4-point harmonic spectrum, matching the dashboard's schema.
+// ============================================================
 
 bool analyzeMicrophone(
     float &rms,
     int32_t &peak,
     float &dominantFrequency,
+    float &power50,
     float &power100,
-    float &power200
+    float &power200,
+    float &power300
 ) {
 
   if (!readMicrophone()) {
@@ -566,12 +613,20 @@ bool analyzeMicrophone(
       calculatePeak();
 
 
+  power50 =
+      goertzelPower(50.0);
+
+
   power100 =
       goertzelPower(100.0);
 
 
   power200 =
       goertzelPower(200.0);
+
+
+  power300 =
+      goertzelPower(300.0);
 
 
   dominantFrequency =
@@ -583,7 +638,7 @@ bool analyzeMicrophone(
 
 
 // ============================================================
-//         BASELINE + HEALTH SCORE ENGINE (NEW)
+//         BASELINE + HEALTH SCORE ENGINE
 // ============================================================
 //
 // Phase 1 (BASELINING): the first BASELINE_SAMPLES loop cycles
@@ -592,7 +647,7 @@ bool analyzeMicrophone(
 //
 // Phase 2 (MONITORING): every reading is compared against the
 // learned baseline. A single deviating reading nudges the health
-// score down but does NOT escalate the category — only a
+// score down but does NOT escalate the category -- only a
 // persistent (repeated) or worsening pattern does that.
 // ============================================================
 
@@ -608,23 +663,32 @@ int baselineSampleCount = 0;
 // Accumulators used while learning the baseline.
 float baseVibrationAccum  = 0;
 float baseRMSAccum        = 0;
+float basePower50Accum    = 0;
 float basePower100Accum   = 0;
 float basePower200Accum   = 0;
+float basePower300Accum   = 0;
 
 // The learned baseline (valid once systemState == MONITORING).
 float baselineVibration = 0;
 float baselineRMS       = 0;
+float baselinePower50   = 0;
 float baselinePower100  = 0;
 float baselinePower200  = 0;
+float baselinePower300  = 0;
 
 // Rolling history of the combined per-reading deviation score.
 // Index HISTORY_LENGTH-1 is always the most recent reading.
 float deviationHistory[HISTORY_LENGTH] = {0, 0, 0, 0, 0};
 
-// Reference orientation used to compute the vibration "movement index".
-// Captured once, on the very first accelerometer reading.
+// Reference orientation used to compute the vibration "movement index"
+// that anomaly detection runs on (delta from rest position).
 int16_t refX = 0, refY = 0, refZ = 0;
 bool referenceSet = false;
+
+// Last known-good DHT11 reading, so a single failed read doesn't
+// blank out the JSON output.
+float lastGoodTemperature = 0;
+float lastGoodHumidity    = 0;
 
 
 // ------------------------------------------------------------
@@ -697,7 +761,7 @@ bool isTrendWorsening() {
 
 
 // ------------------------------------------------------------
-// Human-readable label for a category code (Serial debugging).
+// Human-readable label for a category code (Serial debug logs).
 // ------------------------------------------------------------
 
 const char* categoryName(uint8_t code) {
@@ -713,19 +777,120 @@ const char* categoryName(uint8_t code) {
 }
 
 
+// ------------------------------------------------------------
+// Title-case status label, matching the JSON schema's "status"
+// field exactly (e.g. "Critical", not "CRITICAL").
+// ------------------------------------------------------------
+
+String jsonStatusName(uint8_t code) {
+
+  switch (code) {
+    case CATEGORY_NORMAL:       return "Normal";
+    case CATEGORY_MONITOR:      return "Monitor";
+    case CATEGORY_INSPECT_SOON: return "Inspect Soon";
+    case CATEGORY_CRITICAL:     return "Critical";
+    case CATEGORY_BASELINING:   return "Baselining";
+    default:                    return "Unknown";
+  }
+}
+
+
+// ------------------------------------------------------------
+// Short human-readable explanation matching the category, in the
+// same tone as the frontend's mockData.js. Templated, not sensor
+// data -- feel free to reword these to match your team's voice.
+// ------------------------------------------------------------
+
+String jsonExplanation(uint8_t code) {
+
+  switch (code) {
+
+    case CATEGORY_NORMAL:
+      return "Acoustic harmonics align with healthy baseline. Vibration and thermal context stable.";
+
+    case CATEGORY_MONITOR:
+      return "Isolated acoustic spike detected. Persistence filter active; no fault declared.";
+
+    case CATEGORY_INSPECT_SOON:
+      return "Repeated harmonic deviation detected across recent readings. Inspection priority raised.";
+
+    case CATEGORY_CRITICAL:
+      return "Persistent harmonic and structural vibration escalation. Immediate dispatch required.";
+
+    case CATEGORY_BASELINING:
+      return "Learning this transformer's normal acoustic baseline. No status yet.";
+
+    default:
+      return "";
+  }
+}
+
+
+// ------------------------------------------------------------
+// Scale a raw Goertzel power value into a small human-readable
+// integer for the JSON "harmonics" block. Display-only -- see
+// HARMONIC_DISPLAY_SCALE comment near the top of this file.
+// ------------------------------------------------------------
+
+int scaledHarmonic(float rawPower) {
+
+  long scaled = (long)(rawPower * HARMONIC_DISPLAY_SCALE);
+
+  if (scaled < 0) {
+    scaled = 0;
+  }
+
+  if (scaled > HARMONIC_DISPLAY_MAX) {
+    scaled = HARMONIC_DISPLAY_MAX;
+  }
+
+  return (int)scaled;
+}
+
+
+// ------------------------------------------------------------
+// Load current: NOT a real sensor reading (see HAS_CURRENT_SENSOR
+// note near the top of this file). Returns "N/A" until a real
+// current sensor is wired in and this function is replaced with
+// an actual ADC read + calibration.
+// ------------------------------------------------------------
+
+String readLoadCurrentString() {
+
+#if HAS_CURRENT_SENSOR
+
+  // TODO: replace with a real analog read + calibration once a
+  // current sensor (e.g. ACS712 / non-invasive CT clamp) is wired.
+  float amps = 0.0;
+
+  return String(amps, 1) + " A";
+
+#else
+
+  return "N/A";
+
+#endif
+}
+
+
 // ============================================================
-//                    BLE BROADCAST (NEW)
+//                    BLE BROADCAST
 // ============================================================
 //
 // Advertising-only BLE: no pairing, no GATT connection required.
 // Any nearby scanner (a phone, a laptop, nRF Connect) can read
 // the status straight out of the advertisement packet.
 //
-// Manufacturer data payload (6 bytes):
+// Manufacturer data payload (6 bytes) -- kept intentionally small,
+// this is just enough for a passing scanner to relay:
 //   [0-1] Company ID placeholder (0xFFFF = unallocated/test range)
 //   [2-3] Transformer ID (uint16, little-endian)
 //   [4]   Health score (0-100)
 //   [5]   Category code (see CATEGORY_* constants)
+//
+// The full feature set (harmonics, temp, humidity, etc.) is sent
+// over Serial as JSON instead -- BLE advertisement payloads are
+// too small (~20-25 usable bytes) to carry all of that.
 // ============================================================
 
 BLEAdvertising *pAdvertising;
@@ -766,6 +931,115 @@ void broadcastHealthStatus(uint8_t healthScore, uint8_t categoryCode) {
 
 
 // ============================================================
+//                    JSON STATUS OUTPUT
+// ============================================================
+//
+// Printed once per loop over Serial, matching the frontend's
+// mockData.js shape exactly:
+//
+// {"txId":"TX-RUR-0941","substation":"Vellore 110/11kV Sub-02",
+//  "district":"Vellore","healthScore":41,"status":"Critical",
+//  "harmonicDev":68.2,"vibRMS":1.15,"temp":33.8,"humidity":58.0,
+//  "loadCurrent":"4.9 A","explanation":"...",
+//  "harmonics":{"50Hz":88,"100Hz":110,"200Hz":72,"300Hz":55},
+//  "baseline":{"50Hz":80,"100Hz":94,"200Hz":28,"300Hz":14}}
+//
+// (all on one line -- wrapped above only for readability here)
+// ============================================================
+
+void printJSONStatus(
+    uint8_t  healthScore,
+    uint8_t  categoryCode,
+    float    harmonicDev,
+    float    vibRMS,
+    float    temperature,
+    float    humidity,
+    String   loadCurrent,
+    float    power50,
+    float    power100,
+    float    power200,
+    float    power300,
+    float    baseline50,
+    float    baseline100,
+    float    baseline200,
+    float    baseline300
+) {
+
+  String json = "{";
+
+  json += "\"txId\":\"";
+  json += TRANSFORMER_TX_ID;
+  json += "\",";
+
+  json += "\"substation\":\"";
+  json += TRANSFORMER_SUBSTATION;
+  json += "\",";
+
+  json += "\"district\":\"";
+  json += TRANSFORMER_DISTRICT;
+  json += "\",";
+
+  json += "\"healthScore\":";
+  json += healthScore;
+  json += ",";
+
+  json += "\"status\":\"";
+  json += jsonStatusName(categoryCode);
+  json += "\",";
+
+  json += "\"harmonicDev\":";
+  json += String(harmonicDev, 1);
+  json += ",";
+
+  json += "\"vibRMS\":";
+  json += String(vibRMS, 2);
+  json += ",";
+
+  json += "\"temp\":";
+  json += String(temperature, 1);
+  json += ",";
+
+  json += "\"humidity\":";
+  json += String(humidity, 1);
+  json += ",";
+
+  json += "\"loadCurrent\":\"";
+  json += loadCurrent;
+  json += "\",";
+
+  json += "\"explanation\":\"";
+  json += jsonExplanation(categoryCode);
+  json += "\",";
+
+  json += "\"harmonics\":{";
+  json += "\"50Hz\":";
+  json += scaledHarmonic(power50);
+  json += ",\"100Hz\":";
+  json += scaledHarmonic(power100);
+  json += ",\"200Hz\":";
+  json += scaledHarmonic(power200);
+  json += ",\"300Hz\":";
+  json += scaledHarmonic(power300);
+  json += "},";
+
+  json += "\"baseline\":{";
+  json += "\"50Hz\":";
+  json += scaledHarmonic(baseline50);
+  json += ",\"100Hz\":";
+  json += scaledHarmonic(baseline100);
+  json += ",\"200Hz\":";
+  json += scaledHarmonic(baseline200);
+  json += ",\"300Hz\":";
+  json += scaledHarmonic(baseline300);
+  json += "}";   // close baseline
+
+  json += "}";   // close root object
+
+  Serial.println(json);
+}
+
+
+// ============================================================
 //                        SETUP
 // ============================================================
 
@@ -782,7 +1056,7 @@ void setup() {
   );
 
   Serial.println(
-    "       TRANSVANI EDGE NODE V2"
+    "       TRANSVANI EDGE NODE V3"
   );
 
   Serial.println(
@@ -924,7 +1198,7 @@ void setup() {
   );
 
   Serial.println(
-    "  - Acoustic signal"
+    "  - Acoustic signal (50/100/200/300 Hz)"
   );
 
   Serial.print(
@@ -956,7 +1230,7 @@ void loop() {
   // ADXL345
   // ========================================================
 
-  int16_t x, y, z;
+  int16_t x = 0, y = 0, z = 0;
 
   bool accelOK =
       readADXL(
@@ -965,7 +1239,8 @@ void loop() {
         z
       );
 
-  float movementValue = 0;
+  float movementValue = 0;   // used for anomaly detection (delta from rest reference)
+  float vibRMS_g       = 0;   // used for JSON display (raw acceleration magnitude, in g)
 
   if (accelOK) {
 
@@ -1020,6 +1295,19 @@ void loop() {
     Serial.println(
       movementValue
     );
+
+
+    // Raw acceleration magnitude in g (includes gravity -- reads
+    // ~1.0g at rest). This is what gets reported as "vibRMS" in
+    // the JSON output; it is a single-sample magnitude, not a
+    // true time-averaged RMS.
+
+    vibRMS_g =
+        sqrt(
+          ((float)x * (float)x) +
+          ((float)y * (float)y) +
+          ((float)z * (float)z)
+        ) * ADXL345_LSB_TO_G;
   }
 
   else {
@@ -1048,6 +1336,10 @@ void loop() {
 
   if (dhtOK) {
 
+    lastGoodTemperature = temperature;
+
+    lastGoodHumidity = humidity;
+
     Serial.print(
       "DHT11 | Temperature: "
     );
@@ -1074,7 +1366,7 @@ void loop() {
   else {
 
     Serial.println(
-      "DHT11 | READ FAILED"
+      "DHT11 | READ FAILED (using last known-good values)"
     );
   }
 
@@ -1089,9 +1381,13 @@ void loop() {
 
   float dominantFrequency = 0;
 
+  float power50 = 0;
+
   float power100 = 0;
 
   float power200 = 0;
+
+  float power300 = 0;
 
 
   bool microphoneOK =
@@ -1099,8 +1395,10 @@ void loop() {
         rms,
         peak,
         dominantFrequency,
+        power50,
         power100,
-        power200
+        power200,
+        power300
       );
 
 
@@ -1140,12 +1438,22 @@ void loop() {
 
 
     Serial.print(
+      "MIC | 50 Hz Power: "
+    );
+
+    Serial.println(
+      power50,
+      4
+    );
+
+
+    Serial.print(
       "MIC | 100 Hz Power: "
     );
 
     Serial.println(
       power100,
-      2
+      4
     );
 
 
@@ -1155,7 +1463,17 @@ void loop() {
 
     Serial.println(
       power200,
-      2
+      4
+    );
+
+
+    Serial.print(
+      "MIC | 300 Hz Power: "
+    );
+
+    Serial.println(
+      power300,
+      4
     );
   }
 
@@ -1173,6 +1491,7 @@ void loop() {
 
   uint8_t healthScore   = 100;
   uint8_t categoryCode  = CATEGORY_BASELINING;
+  float   harmonicDev   = 0;    // average % deviation across 50/100/200/300 Hz
 
   if (systemState == BASELINING) {
 
@@ -1182,8 +1501,10 @@ void loop() {
 
     baseVibrationAccum += movementValue;
     baseRMSAccum        += rms;
-    basePower100Accum   += power100;
-    basePower200Accum   += power200;
+    basePower50Accum     += power50;
+    basePower100Accum    += power100;
+    basePower200Accum    += power200;
+    basePower300Accum    += power300;
 
     baselineSampleCount++;
 
@@ -1204,8 +1525,10 @@ void loop() {
 
       baselineVibration = baseVibrationAccum / BASELINE_SAMPLES;
       baselineRMS        = baseRMSAccum / BASELINE_SAMPLES;
+      baselinePower50     = basePower50Accum / BASELINE_SAMPLES;
       baselinePower100    = basePower100Accum / BASELINE_SAMPLES;
       baselinePower200    = basePower200Accum / BASELINE_SAMPLES;
+      baselinePower300    = basePower300Accum / BASELINE_SAMPLES;
 
       systemState = MONITORING;
 
@@ -1218,24 +1541,34 @@ void loop() {
       );
 
       Serial.print(
-        "  Vibration:  "
+        "  Vibration:   "
       );
       Serial.println(baselineVibration);
 
       Serial.print(
-        "  RMS:        "
+        "  RMS:         "
       );
       Serial.println(baselineRMS);
 
       Serial.print(
+        "  50Hz power:  "
+      );
+      Serial.println(baselinePower50, 4);
+
+      Serial.print(
         "  100Hz power: "
       );
-      Serial.println(baselinePower100);
+      Serial.println(baselinePower100, 4);
 
       Serial.print(
         "  200Hz power: "
       );
-      Serial.println(baselinePower200);
+      Serial.println(baselinePower200, 4);
+
+      Serial.print(
+        "  300Hz power: "
+      );
+      Serial.println(baselinePower300, 4);
 
       Serial.println(
         "SWITCHING TO MONITORING MODE"
@@ -1248,6 +1581,7 @@ void loop() {
 
     healthScore  = 100;
     categoryCode = CATEGORY_BASELINING;
+    harmonicDev  = 0;
   }
 
   else {
@@ -1258,15 +1592,23 @@ void loop() {
 
     float vibDeviation  = percentDeviation(movementValue, baselineVibration);
     float rmsDeviation  = percentDeviation(rms, baselineRMS);
+    float p50Deviation  = percentDeviation(power50, baselinePower50);
     float p100Deviation = percentDeviation(power100, baselinePower100);
     float p200Deviation = percentDeviation(power200, baselinePower200);
+    float p300Deviation = percentDeviation(power300, baselinePower300);
 
-    // Weighted combination -> a single "how off is this reading" score.
+    // Average deviation across all four harmonics -- this is the
+    // number reported as "harmonicDev" in the JSON output.
+    harmonicDev =
+        (p50Deviation + p100Deviation + p200Deviation + p300Deviation) / 4.0;
+
+    // Weighted combination -> a single "how off is this reading" score,
+    // used for the health score and the persistence/trend engine.
+    //   30% vibration, 20% acoustic RMS (loudness), 50% harmonic content
     float overallDeviation =
-        (0.35 * vibDeviation) +
-        (0.25 * rmsDeviation) +
-        (0.20 * p100Deviation) +
-        (0.20 * p200Deviation);
+        (0.30 * vibDeviation) +
+        (0.20 * rmsDeviation) +
+        (0.50 * harmonicDev);
 
     pushDeviationHistory(overallDeviation);
 
@@ -1284,6 +1626,11 @@ void loop() {
     Serial.print(rmsDeviation, 1);
 
     Serial.print(
+      "%  50Hz: "
+    );
+    Serial.print(p50Deviation, 1);
+
+    Serial.print(
       "%  100Hz: "
     );
     Serial.print(p100Deviation, 1);
@@ -1292,6 +1639,11 @@ void loop() {
       "%  200Hz: "
     );
     Serial.print(p200Deviation, 1);
+
+    Serial.print(
+      "%  300Hz: "
+    );
+    Serial.print(p300Deviation, 1);
 
     Serial.println(
       "%"
@@ -1366,10 +1718,35 @@ void loop() {
 
 
   // ========================================================
-  // BLE BROADCAST
+  // BLE BROADCAST (score + category only -- see comment above
+  // broadcastHealthStatus() for why the full feature set isn't
+  // stuffed into the tiny advertisement payload)
   // ========================================================
 
   broadcastHealthStatus(healthScore, categoryCode);
+
+
+  // ========================================================
+  // JSON STATUS OUTPUT (Serial -- for collector.py / dashboard)
+  // ========================================================
+
+  printJSONStatus(
+    healthScore,
+    categoryCode,
+    harmonicDev,
+    vibRMS_g,
+    lastGoodTemperature,
+    lastGoodHumidity,
+    readLoadCurrentString(),
+    power50,
+    power100,
+    power200,
+    power300,
+    baselinePower50,
+    baselinePower100,
+    baselinePower200,
+    baselinePower300
+  );
 
 
   // ========================================================
