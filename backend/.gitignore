@@ -1,0 +1,8 @@
+# Ignore Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Transformer data
+transvani.db
